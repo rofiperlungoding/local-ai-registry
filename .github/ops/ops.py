@@ -51,10 +51,16 @@ def bounties(prs):
     issues = ghjson("issue", "list", "-R", REGISTRY, "--label", "bounty", "--state", "all", "--limit", "500",
                     "--json", "number,title,state,labels")
     out = []
+    
+    # Track person/device payouts to enforce rules: one payout per person per device, $1000 monthly cap
+    person_devices = set()
+    monthly_payouts = {}
+
     for i in sorted(issues, key=lambda x: x["number"]):
         n = i["number"]
         labels = [l["name"] for l in i["labels"]]
         amount = next((int(m.group(1)) for l in labels if (m := re.match(r"bounty: \$(\d+)", l))), 50)
+        device_name = re.sub(r"^Bounty \$\d+: recipe for ", "", i["title"]).strip()
         comments = ghjson("api", f"repos/{REGISTRY}/issues/{n}/comments?per_page=100")
         claims = []  # each person's first /attempt only
         for c in comments:
@@ -70,8 +76,36 @@ def bounties(prs):
                         "state": "merged" if p["mergedAt"] else p["state"].lower(), "mergedAt": p["mergedAt"],
                         "checks": checks(p["statusCheckRollup"])}
                        for p in prs if ref(p)), key=lambda s: s["at"])
-        won = next((s for s in subs if s["state"] == "merged"), None)
-        out.append({"issue": n, "device": re.sub(r"^Bounty \$\d+: recipe for ", "", i["title"]).strip(),
+        
+        # Evaluate valid winning PR according to rules:
+        # 1. Author not in STAFF
+        # 2. PR is merged
+        # 3. One payout per person per device
+        # 4. Monthly cap of $1000 by merge month
+        won = None
+        for s in subs:
+            if s["state"] == "merged" and s["mergedAt"]:
+                author = s["by"]
+                merge_month = s["mergedAt"][:7]
+                
+                # Check duplicate per person per device
+                pd_key = (author, device_name)
+                if pd_key in person_devices:
+                    continue
+                
+                # Check monthly cap
+                current_month_total = monthly_payouts.get(merge_month, 0)
+                if current_month_total + amount > CAP:
+                    # Exceeds monthly cap, cannot be paid out this month
+                    continue
+                
+                # Valid payout
+                person_devices.add(pd_key)
+                monthly_payouts[merge_month] = current_month_total + amount
+                won = s
+                break
+
+        out.append({"issue": n, "device": device_name,
                     "amount": amount, "state": i["state"].lower(), "claims": claims, "prs": subs,
                     "paidTo": won and won["by"], "pr": won and won["pr"], "month": won and won["mergedAt"][:7]})
     return out
